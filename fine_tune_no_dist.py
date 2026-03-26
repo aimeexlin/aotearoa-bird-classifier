@@ -64,11 +64,7 @@ def build_loader(dataset, batch_size, shuffle, args):
         "batch_size": batch_size,
         "shuffle": shuffle,
         "num_workers": args.num_workers,
-        "pin_memory": args.pin_memory,
     }
-    if args.num_workers > 0:
-        kwargs["prefetch_factor"] = args.prefetch_factor
-        kwargs["persistent_workers"] = args.persistent_workers
     return DataLoader(dataset, **kwargs)
 
 
@@ -82,16 +78,13 @@ def parse_args():
     parser.add_argument("--val-split", type=str, default="test", help="Validation split under dataset/<val-split>. Use None to disable validation.")
     parser.add_argument("--val-batch-size", type=int, default=64, help="Validation batch size")
     parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers")
-    parser.add_argument("--pin-memory", action="store_true", help="Enable pin_memory in DataLoader (off by default for safer low-shm environments)")
-    parser.add_argument("--prefetch-factor", type=int, default=1, help="Per-worker prefetch batches when num_workers > 0")
-    parser.add_argument("--persistent-workers", action="store_true", help="Keep DataLoader workers alive between epochs")
     parser.add_argument("--checkpoint-every", type=int, default=1, help="Checkpoint period in epochs")
     parser.add_argument("--early-stop-patience", type=int, default=5, help="Stop after N bad epochs")
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum loss improvement")
     parser.add_argument("--lr-base", type=float, default=1e-6, help="Base LR before batch scaling")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Weight decay")
     parser.add_argument("--momentum", type=float, default=0.9, help="RMSprop momentum")
-    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
+    parser.add_argument("--loss", choices=["ce", "wce", "focal", "ldam"], default="ce", help="Loss function (cross-entropy, weighted CE, focal, LDAM)")
     return parser.parse_args()
 
 
@@ -165,6 +158,29 @@ def evaluate(model, loader, criterion, device):
     processed = 0
     top1_correct = 0
     top5_correct = 0
+    # For tail-aware metric
+    processed_binned = [0, 0, 0, 0, 0]
+    correct_binned = [0, 0, 0, 0, 0]
+    # Load instance counts for binning
+    import pickle
+    import math
+    try:
+        with open("instance_count.pkl", "rb") as f:
+            instance_count = pickle.load(f)
+    except Exception:
+        instance_count = None
+    def instance_bin(n):
+        if n < 5:  return 0
+        if n < 10: return 1
+        if n < 20: return 2
+        if n < 50: return 3
+        return 4
+    class_bins = None
+    if hasattr(loader.dataset, 'class_to_idx') and instance_count is not None:
+        class_bins = {
+            v: instance_bin(instance_count.get(k, 0))
+            for k, v in loader.dataset.class_to_idx.items()
+        }
     with torch.no_grad():
         progress = tqdm(
             loader,
@@ -189,12 +205,26 @@ def evaluate(model, loader, criterion, device):
             top1_correct += correct[:, 0].sum().item()
             top5_correct += correct.any(dim=1).sum().item()
 
+            # Tail-aware binning
+            if class_bins is not None:
+                for t, c in zip(targets.cpu().tolist(), correct[:, 0].cpu().tolist()):
+                    tb = class_bins.get(t, None)
+                    if tb is not None:
+                        processed_binned[tb] += 1
+                        correct_binned[tb] += c
+
             progress.set_postfix(loss=f"{running_loss / max(processed, 1):.4f}")
 
     avg_loss = running_loss / max(processed, 1)
     top1 = 100.0 * top1_correct / max(processed, 1)
     top5 = 100.0 * top5_correct / max(processed, 1)
-    return avg_loss, top1, top5
+    # Tail-aware metric: mean accuracy for bins 0,1,2 (1-4, 5-9, 10-19)
+    tail_accs = []
+    for k in range(3):
+        if processed_binned[k] > 0:
+            tail_accs.append(100.0 * correct_binned[k] / processed_binned[k])
+    tail_metric = float(sum(tail_accs)) / max(len(tail_accs), 1)
+    return avg_loss, top1, top5, tail_metric
 
 
 def main():
@@ -230,9 +260,7 @@ def main():
     print(f"Validation split: {('dataset/' + args.val_split) if val_enabled else 'disabled'}", flush=True)
     print(f"Batch size: {batch_size}", flush=True)
     print(
-        f"DataLoader: workers={args.num_workers}, pin_memory={args.pin_memory}, "
-        f"prefetch_factor={(args.prefetch_factor if args.num_workers > 0 else 'n/a')}, "
-        f"persistent_workers={(args.persistent_workers if args.num_workers > 0 else 'n/a')}",
+        f"DataLoader: workers={args.num_workers}",
         flush=True,
     )
     print(f"Epoch stages: {args.epochs} (total={sum(args.epochs)})", flush=True)
@@ -253,17 +281,6 @@ def main():
         model = nn.DataParallel(model)
         print(f"DataParallel enabled on {torch.cuda.device_count()} GPUs", flush=True)
 
-    if not args.no_compile and hasattr(torch, "compile") and not isinstance(model, nn.DataParallel):
-        try:
-            model = torch.compile(model)
-            print("torch.compile enabled", flush=True)
-        except Exception as exc:
-            print(f"torch.compile unavailable, continuing without it: {exc}", flush=True)
-    elif isinstance(model, nn.DataParallel) and not args.no_compile:
-        print("torch.compile skipped (DataParallel enabled)", flush=True)
-
-    criterion = nn.CrossEntropyLoss().to(device)
-
     normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(300 if args.model_size == "s" else 384),
@@ -277,6 +294,32 @@ def main():
     except TypeError:
         train_dataset = datasets.ImageFolder(f"dataset/{args.split}", transform=train_transform)
     train_loader = build_loader(train_dataset, batch_size, True, args)
+
+    class_counts = torch.bincount(torch.tensor(train_dataset.targets), minlength=num_classes).float()
+    class_counts = torch.clamp(class_counts, min=1)
+
+    # effective number weighting
+    beta = 0.9999
+    effective_num = 1.0 - torch.pow(beta, class_counts)
+    weights = (1.0 - beta) / (effective_num + 1e-8)
+    weights = weights / weights.sum() * num_classes
+
+    weights = weights.to(device)
+
+    if args.loss == "ce":
+        criterion = nn.CrossEntropyLoss()
+
+    elif args.loss == "wce":
+        criterion = nn.CrossEntropyLoss(weight=weights)
+
+    elif args.loss == "focal":
+        criterion = timm.loss.FocalLoss(gamma=2.0)
+
+    elif args.loss == "ldam":
+        # implement!
+        pass
+
+    criterion = criterion.to(device)
 
     val_loader = None
     if val_enabled:
@@ -320,7 +363,7 @@ def main():
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
     writer = SummaryWriter(str(checkpoints_dir / "tb"))
 
-    best_epoch_loss = float("inf")
+    best_tail_metric = -float("inf")
     epochs_without_improvement = 0
     start_epoch = 0
     checkpoint = None
@@ -428,7 +471,7 @@ def main():
                 if loader_worker_failed and args.num_workers > 0 and not epoch_retried_for_loader:
                     print(
                         "DataLoader worker failure detected. "
-                        f"Falling back to num_workers={max(args.num_workers - 1, 0)}, pin_memory=False and restarting epoch.",
+                        f"Falling back to num_workers={max(args.num_workers - 1, 0)} and restarting epoch.",
                         flush=True,
                     )
                     args.num_workers = max(args.num_workers - 1, 0)
@@ -454,27 +497,30 @@ def main():
 
         metric_name = "train/loss"
         metric_value = epoch_loss
+        tail_metric = None
         if val_loader is not None:
-            val_loss, val_top1, val_top5 = evaluate(model, val_loader, criterion, device)
+            val_loss, val_top1, val_top5, tail_metric = evaluate(model, val_loader, criterion, device)
             writer.add_scalar("val/loss_epoch", val_loss, epoch)
             writer.add_scalar("val/top1", val_top1, epoch)
             writer.add_scalar("val/top5", val_top5, epoch)
+            writer.add_scalar("val/tail_metric", tail_metric, epoch)
             print(
-                f"Validation | loss={val_loss:.6f} | top1={val_top1:.3f}% | top5={val_top5:.3f}%",
+                f"Validation | loss={val_loss:.6f} | top1={val_top1:.3f}% | top5={val_top5:.3f}% | tail_metric={tail_metric:.3f}",
                 flush=True,
             )
-            metric_name = "val/loss"
-            metric_value = val_loss
+            metric_name = "val/tail_metric"
+            metric_value = tail_metric
 
-        improved = (best_epoch_loss - metric_value) > args.early_stop_min_delta
+        # Early stopping: maximize tail_metric (mean acc for bins 1-4, 5-9, 10-19)
+        improved = (metric_value - best_tail_metric) > args.early_stop_min_delta
         if improved:
-            best_epoch_loss = metric_value
+            best_tail_metric = metric_value
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
             print(
                 f"No significant improvement for {epochs_without_improvement} epoch(s). "
-                f"Best {metric_name}: {best_epoch_loss:.6f}",
+                f"Best {metric_name}: {best_tail_metric:.6f}",
                 flush=True,
             )
 

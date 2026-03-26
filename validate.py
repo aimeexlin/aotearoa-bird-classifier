@@ -245,9 +245,15 @@ for epoch in range(start_epoch, end_epoch + 1, 1): # was 5
 
     top_k_accs = [float(f"{100.0 * tc / processed:3.3f}") for tc in top_correct]
     avg_loss = running_loss / (step + 1)
+    # Tail-aware metric: mean accuracy for bins 0,1,2 (1-4, 5-9, 10-19)
+    tail_accs = []
+    for k in range(3):
+        if processed_binned[k] > 0:
+            tail_accs.append(100.0 * correct_binned[k] / processed_binned[k])
+    tail_metric = float(sum(tail_accs)) / max(len(tail_accs), 1)
     print(
         f"Epoch {epoch} complete | loss={avg_loss:.4f} | "
-        f"top1={top_k_accs[0]:.2f}% | top5={top_k_accs[4]:.2f}%",
+        f"top1={top_k_accs[0]:.2f}% | top5={top_k_accs[4]:.2f}% | tail_metric={tail_metric:.3f}",
         flush=True,
     )
     bin_labels = ["1-4", "5-9", "10-19", "20-49", "50+"]
@@ -260,6 +266,7 @@ for epoch in range(start_epoch, end_epoch + 1, 1): # was 5
 
     # TensorBoard logging
     writer_summary.add_scalar("summary/loss", avg_loss, epoch)
+    writer_summary.add_scalar("summary/tail_metric", tail_metric, epoch)
     for k, bin_range in enumerate(["1_4", "5_9", "10_19", "20_49", "50_"]):
         if processed_binned[k] > 0:
             writer_summary.add_scalar(
