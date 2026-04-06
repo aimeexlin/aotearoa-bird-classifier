@@ -1,6 +1,6 @@
 # Aotearoa Bird Classifier
 
-Deep learning project based on original [Aotearoa Species Classifier](https://github.com/Waikato/aotearoa-species-classifier). Reproduced model on birds subset of original dataset and investigated backbones, losses, and augmentations.
+Deep learning project based on [Aotearoa Species Classifier](https://github.com/Waikato/aotearoa-species-classifier). Reproduced model on birds subset of original dataset and investigated backbones, losses, and augmentations.
 
 ## Installation
 
