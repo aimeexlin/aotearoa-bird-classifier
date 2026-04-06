@@ -1,9 +1,11 @@
+import argparse
 import math
 import os
+import random
 import pickle
-import sys
 from pathlib import Path
 
+import numpy as np
 import timm
 import torch
 import torch.nn as nn
@@ -13,7 +15,22 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 
+def get_logits(output):
+    return output.logits if hasattr(output, "logits") else output
+
+# same as fine_tune.py
+BACKBONES = {
+    "env2":  ("tf_efficientnetv2_s.in21k",          416, 384),
+    "cnx_i": ("convnext_small.fb_in22k",            256, 224),
+    "cnx_d": ("convnext_small.dinov3_lvd1689m",     256, 224),
+    "vit_d": ("vit_base_patch16_dinov3.lvd1689m",   256, 224),
+    "vit_i": ("google/vit-base-patch16-224-in21k",   256, 224),
+    "vit_inat": ("bryanzhou008/vit-base-patch16-224-in21k-finetuned-inaturalist", 256, 224),
+}
+
+# dataset
 class ImageFolderAllowEmpty(torch.utils.data.Dataset):
+    """ImageFolder that tolerates empty class directories in the test split."""
     def __init__(self, root, transform=None):
         self.transform = transform
         self.loader = default_loader
@@ -50,7 +67,8 @@ class ImageFolderAllowEmpty(torch.utils.data.Dataset):
             sample = self.transform(sample)
         return sample, target
 
-# abstention
+
+# abstention masks
 def confidence_mask(probabilities, threshold):
     return probabilities.max(1)[0] > threshold
 
@@ -66,33 +84,17 @@ def entropy_mask(probabilities, threshold):
         > threshold
     )
 
-# helper
+# helpers
 def get_num_classes_from_checkpoint(checkpoint):
-    """Read num_classes stored in checkpoint, or infer from classifier weight shape."""
     if "num_classes" in checkpoint:
         return int(checkpoint["num_classes"])
     state = checkpoint["model"]
     for prefix in ("", "module."):
-        key = f"{prefix}classifier.weight"
-        if key in state:
-            return state[key].shape[0]
+        for suffix in ("head.weight", "classifier.weight"):
+            key = f"{prefix}{suffix}"
+            if key in state:
+                return state[key].shape[0]
     raise KeyError("Cannot determine num_classes from checkpoint.")
-
-
-def adapt_classifier_state_dict(state_dict, num_classes):
-    """Shrink classifier head if checkpoint was saved with more classes (e.g. 14991 -> 336)."""
-    for prefix in ("", "module."):
-        w_key = f"{prefix}classifier.weight"
-        b_key = f"{prefix}classifier.bias"
-        if w_key in state_dict and b_key in state_dict:
-            rows = state_dict[w_key].shape[0]
-            if rows > num_classes:
-                print(f"Adapting classifier head: {rows} -> {num_classes} classes", flush=True)
-                state_dict[w_key] = state_dict[w_key][:num_classes].clone()
-                state_dict[b_key] = state_dict[b_key][:num_classes].clone()
-            return state_dict
-    return state_dict
-
 
 def instance_bin(n):
     if n < 5:  return 0
@@ -101,186 +103,288 @@ def instance_bin(n):
     if n < 50: return 3
     return 4
 
+
+def discover_checkpoint_epochs(checkpoints_dir):
+    epochs = []
+    for ckpt_path in checkpoints_dir.glob("checkpoint_epoch*.pth"):
+        suffix = ckpt_path.stem.removeprefix("checkpoint_epoch")
+        if suffix.isdigit():
+            epochs.append(int(suffix))
+    if not epochs:
+        raise FileNotFoundError(f"No checkpoint_epoch*.pth files found under: {checkpoints_dir}")
+    return sorted(set(epochs))
+
+
+def seed_everything(seed):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+# args
+def parse_args():
+    parser = argparse.ArgumentParser(description="Validate bird species classifier checkpoints")
+    parser.add_argument("--backbone", choices=list(BACKBONES.keys()), default="env2",
+                        help="Backbone (must match the training run)")
+    parser.add_argument("--name", required=True,
+                        help="Experiment name — looks for models/<name>/ and writes to tb/<name>/")
+    parser.add_argument("--start", type=int, default=None,
+                        help="First epoch to evaluate; defaults to the smallest checkpoint found")
+    parser.add_argument("--end", type=int, default=None,
+                        help="Last epoch to evaluate; defaults to the largest checkpoint found")
+    parser.add_argument("--step", type=int, default=1,
+                        help="Epoch step between evaluations")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="DataLoader workers")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducible validation")
+    return parser.parse_args()
+
 # main
-abstentions = {"confidence": confidence_mask, "margin": margin_mask, "entropy": entropy_mask}
-thresholds = [
-    0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75,
-    0.8, 0.85, 0.9, 0.95, 0.96, 0.97, 0.98, 0.99, 0.995, 0.998, 0.999,
-]
+def main():
+    args = parse_args()
 
-model_size = sys.argv[1]
-checkpoints_dir = sys.argv[2]
-start_epoch = int(sys.argv[3])
-end_epoch = int(sys.argv[4])
+    _, val_resize, val_crop = BACKBONES[args.backbone]
+    is_hf_backbone = args.backbone in {"vit_i", "vit_inat"}
 
-print("=" * 80, flush=True)
-print("Starting validation", flush=True)
-print(f"Device: {'cuda' if torch.cuda.is_available() else 'cpu'}", flush=True)
-print(f"Model: tf_efficientnetv2_{model_size}", flush=True)
-print(f"Checkpoints dir: {checkpoints_dir}", flush=True)
-print(f"Epoch range: {start_epoch} -> {end_epoch} (step 5)", flush=True)
-print("=" * 80, flush=True)
+    seed_everything(args.seed)
 
-# detect num_classes from first checkpoint
-first_ckpt_path = Path(checkpoints_dir) / f"checkpoint_epoch{start_epoch}.pth"
-first_ckpt = torch.load(str(first_ckpt_path), map_location="cpu")
-num_classes = get_num_classes_from_checkpoint(first_ckpt)
-del first_ckpt
-print(f"✓ Detected num_classes={num_classes} from checkpoint", flush=True)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-model = timm.create_model(
-    f"tf_efficientnetv2_{model_size}",
-    pretrained=False,
-    num_classes=num_classes,
-).cuda()
-criterion = torch.nn.CrossEntropyLoss().cuda()
-print(f"✓ Model created", flush=True)
+    abstentions = {"confidence": confidence_mask, "margin": margin_mask, "entropy": entropy_mask}
+    thresholds = [
+        0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75,
+        0.8, 0.85, 0.9, 0.95, 0.96, 0.97, 0.98, 0.99, 0.995, 0.998, 0.999,
+    ]
 
-# data pipeline
-normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-val_transform = transforms.Compose([
-    transforms.Resize(416 if model_size == "s" else 512),
-    transforms.CenterCrop(384 if model_size == "s" else 480),
-    transforms.ToTensor(),
-    normalize,
-])
-val_dataset = ImageFolderAllowEmpty("dataset/test", transform=val_transform)
-val_loader = torch.utils.data.DataLoader(
-    val_dataset, batch_size=64, shuffle=False, num_workers=0, pin_memory=False,
-)
-print(f"✓ Data loader ready: {len(val_dataset)} images, {len(val_loader)} batches", flush=True)
+    checkpoints_dir = Path(f"models/{args.name}")
+    discovered_epochs = discover_checkpoint_epochs(checkpoints_dir)
 
-# instance count bins
-instance_count = pickle.load(open("instance_count.pkl", "rb"))
-print(f"✓ Loaded instance_count.pkl ({len(instance_count)} classes)", flush=True)
+    if args.start is None:
+        args.start = discovered_epochs[0]
+    if args.end is None:
+        args.end = discovered_epochs[-1]
+    if args.start > args.end:
+        raise ValueError(f"Invalid epoch range: start ({args.start}) is greater than end ({args.end})")
 
-class_bins = {
-    v: instance_bin(instance_count.get(k, 0))
-    for k, v in val_dataset.class_to_idx.items()
-}
+    print("=" * 80, flush=True)
+    print("Starting validation", flush=True)
+    print(f"Device: {device}", flush=True)
+    if device.type == "cuda":
+        visible_gpu_count = torch.cuda.device_count()
+        print(f"Visible CUDA devices: {visible_gpu_count}", flush=True)
+        print(f"GPU names: {[torch.cuda.get_device_name(g) for g in range(visible_gpu_count)]}", flush=True)
+    print(f"Backbone: {args.backbone}", flush=True)
+    print(f"Checkpoints dir: {checkpoints_dir}", flush=True)
+    print(f"Epoch range: {args.start} -> {args.end} (step {args.step})", flush=True)
+    print("=" * 80, flush=True)
 
-# TensorBoard writers
-writer_summary = SummaryWriter(f"{checkpoints_dir}/test/summary_test")
-writers_abstention = {
-    a: SummaryWriter(f"{checkpoints_dir}/test/{a}_test") for a in abstentions
-}
+    first_ckpt_path = checkpoints_dir / f"checkpoint_epoch{args.start}.pth"
+    first_ckpt = torch.load(str(first_ckpt_path), map_location="cpu")
+    num_classes = get_num_classes_from_checkpoint(first_ckpt)
+    del first_ckpt
 
-# eval loop over checkpoints
-for epoch in range(start_epoch, end_epoch + 1, 1): # was 5
-    ckpt_path = Path(checkpoints_dir) / f"checkpoint_epoch{epoch}.pth"
-    if not ckpt_path.exists():
-        print(f"Checkpoint not found, skipping: {ckpt_path}", flush=True)
-        continue
+    model_name, _, _ = BACKBONES[args.backbone]
+    if is_hf_backbone:
+        try:
+            from transformers import AutoImageProcessor, AutoModelForImageClassification
+        except ImportError as exc:
+            raise ImportError(
+                "Backbones vit_i/vit_inat require transformers. Install with: pip install transformers"
+            ) from exc
 
-    print(f"\nLoading checkpoint: {ckpt_path}", flush=True)
-    checkpoint = torch.load(str(ckpt_path), map_location="cuda")
-    model_state = adapt_classifier_state_dict(checkpoint["model"], num_classes)
-    model.load_state_dict(model_state)
-    del checkpoint
-    model.eval()
+        model = AutoModelForImageClassification.from_pretrained(
+            model_name,
+            num_labels=num_classes,
+            ignore_mismatched_sizes=True,
+        ).to(device)
+        image_processor = AutoImageProcessor.from_pretrained(model_name)
+    else:
+        model = timm.create_model(model_name, pretrained=False, num_classes=num_classes).to(device)
+        image_processor = None
+    criterion = nn.CrossEntropyLoss().to(device)
 
-    out_csv = Path(checkpoints_dir) / "test" / f"test_{epoch}.csv"
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open("instance_count.pkl", "rb") as f:
+            instance_count = pickle.load(f)
+    except FileNotFoundError:
+        print("Warning: instance_count.pkl not found, binned metrics unavailable", flush=True)
+        instance_count = None
 
-    running_loss = 0.0
-    processed = 0
-    top_correct = [0] * 5
-    processed_binned = [0] * 5
-    correct_binned = [0] * 5
-    abstention_processed = {a: [0] * len(thresholds) for a in abstentions}
-    abstention_correct   = {a: [0] * len(thresholds) for a in abstentions}
+    if image_processor is not None:
+        mean = tuple(image_processor.image_mean) if image_processor.image_mean is not None else (0.5, 0.5, 0.5)
+        std = tuple(image_processor.image_std) if image_processor.image_std is not None else (0.5, 0.5, 0.5)
+    else:
+        data_config = timm.data.resolve_model_data_config(model)
+        mean = data_config["mean"]
+        std = data_config["std"]
 
-    with open(out_csv, "w") as fp:
-        fp.write("true_label,pred_label,confidence\n")
+    normalize = transforms.Normalize(mean=mean, std=std)
+    val_transform = transforms.Compose([
+        transforms.Resize(val_resize),
+        transforms.CenterCrop(val_crop),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    val_dataset = ImageFolderAllowEmpty("dataset/test", transform=val_transform)
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=64, shuffle=False,
+        num_workers=args.workers, pin_memory=False,
+    )
+    print(f"Validation samples: {len(val_dataset)}", flush=True)
 
-        with torch.no_grad():
-            progress = tqdm(
-                val_loader,
-                total=len(val_loader),
-                desc=f"Epoch {epoch}",
-                leave=True,
-                dynamic_ncols=True,
-            )
-            for step, (inputs, targets) in enumerate(progress):
-                inputs  = inputs.cuda()
-                targets = targets.cuda()
-                outputs = model(inputs)
-                loss    = criterion(outputs, targets)
+    class_bins = {
+        v: instance_bin(instance_count.get(k, 0))
+        for k, v in val_dataset.class_to_idx.items()
+    } if instance_count is not None else {}
 
-                running_loss += loss.item()
-                processed    += targets.size(0)
-                probabilities = torch.softmax(outputs, dim=-1)
+    writer_summary = SummaryWriter(f"tb/{args.name}/test_summary")
+    writers_abstention = {
+        a: SummaryWriter(f"tb/{args.name}/test_{a}") for a in abstentions
+    }
 
-                confidence, predicted = torch.topk(probabilities, 5, 1)
+    best_epoch = None
+    best_tail_metric = None
+    best_top1 = None
+    best_top5 = None
+    best_bin_accs = None
 
-                for tl_i, pl_i, c_i in zip(
-                    targets.cpu(), predicted[:, 0].cpu(), confidence[:, 0].cpu()
-                ):
-                    fp.write(f"{int(tl_i)},{int(pl_i)},{float(c_i)}\n")
+    epochs_to_eval = list(range(args.start, args.end, args.step))
+    if not epochs_to_eval or epochs_to_eval[-1] != args.end:
+        epochs_to_eval.append(args.end)
 
-                correct_labels = predicted == targets.unsqueeze(1)
+    for epoch in epochs_to_eval:
+        ckpt_path = checkpoints_dir / f"checkpoint_epoch{epoch}.pth"
+        if not ckpt_path.exists():
+            print(f"Checkpoint not found, skipping: {ckpt_path}", flush=True)
+            continue
 
-                for a in abstentions:
-                    for i, threshold in enumerate(thresholds):
-                        mask = abstentions[a](probabilities, threshold)
-                        abstention_processed[a][i] += mask.sum().item()
-                        abstention_correct[a][i]   += (correct_labels[:, 0] * mask).sum().item()
+        print(f"Loading checkpoint: {ckpt_path}", flush=True)
+        checkpoint = torch.load(str(ckpt_path), map_location=device)
+        model_state = checkpoint["model"]
+        model.load_state_dict(model_state)
+        del checkpoint
+        model.eval()
 
-                top_correct = [
-                    correct_labels[:, :k + 1].sum().item() + tc
-                    for k, tc in enumerate(top_correct)
-                ]
+        out_csv = checkpoints_dir / f"test_{epoch}.csv"
 
-                for tb, cl in zip(
-                    [class_bins[t] for t in targets.cpu().tolist()],
-                    correct_labels[:, 0].cpu().tolist(),
-                ):
-                    processed_binned[tb] += 1
-                    correct_binned[tb]   += cl
+        running_loss = 0.0
+        processed = 0
+        top_correct = [0] * 5
+        processed_binned = [0] * 5
+        correct_binned = [0] * 5
+        abstention_processed = {a: [0] * len(thresholds) for a in abstentions}
+        abstention_correct   = {a: [0] * len(thresholds) for a in abstentions}
 
-                progress.set_postfix(
-                    loss=f"{running_loss / (step + 1):.4f}",
-                    top1=f"{100.0 * top_correct[0] / processed:.2f}%",
+        with open(out_csv, "w") as fp:
+            fp.write("true_label,pred_label,confidence\n")
+
+            with torch.no_grad():
+                progress = tqdm(
+                    val_loader, total=len(val_loader),
+                    desc=f"Epoch {epoch}", leave=True, dynamic_ncols=True,
+                )
+                for step, (inputs, targets) in enumerate(progress):
+                    inputs  = inputs.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
+                    outputs = get_logits(model(inputs))
+                    loss    = criterion(outputs, targets)
+
+                    running_loss += loss.item()
+                    processed    += targets.size(0)
+                    probabilities = torch.softmax(outputs, dim=-1)
+
+                    confidence, predicted = torch.topk(probabilities, 5, 1)
+
+                    for tl_i, pl_i, c_i in zip(
+                        targets.cpu(), predicted[:, 0].cpu(), confidence[:, 0].cpu()
+                    ):
+                        fp.write(f"{int(tl_i)},{int(pl_i)},{float(c_i)}\n")
+
+                    correct_labels = predicted == targets.unsqueeze(1)
+
+                    for a in abstentions:
+                        for i, threshold in enumerate(thresholds):
+                            mask = abstentions[a](probabilities, threshold)
+                            abstention_processed[a][i] += mask.sum().item()
+                            abstention_correct[a][i]   += (correct_labels[:, 0] * mask).sum().item()
+
+                    top_correct = [
+                        correct_labels[:, :k + 1].sum().item() + tc
+                        for k, tc in enumerate(top_correct)
+                    ]
+
+                    for tb, cl in zip(
+                        [class_bins[t] for t in targets.cpu().tolist()],
+                        correct_labels[:, 0].cpu().tolist(),
+                    ):
+                        processed_binned[tb] += 1
+                        correct_binned[tb]   += cl
+
+                    progress.set_postfix(
+                        loss=f"{running_loss / (step + 1):.4f}",
+                        top1=f"{100.0 * top_correct[0] / processed:.2f}%",
+                    )
+
+        top_k_accs = [float(f"{100.0 * tc / processed:3.3f}") for tc in top_correct]
+        avg_loss = running_loss / (step + 1)
+        tail_accs = [
+            100.0 * correct_binned[k] / processed_binned[k]
+            for k in range(3) if processed_binned[k] > 0
+        ]
+        tail_metric = sum(tail_accs) / max(len(tail_accs), 1)
+        print(
+            f"Epoch {epoch} complete | loss={avg_loss:.4f} | "
+            f"top1={top_k_accs[0]:.2f}% | top5={top_k_accs[4]:.2f}% | tail={tail_metric:.3f}%",
+            flush=True,
+        )
+        bin_labels = ["1-4", "5-9", "10-19", "20-49", "50+"]
+        bin_accs = [
+            f"{bin_labels[k]}: {100.0 * correct_binned[k] / processed_binned[k]:.1f}%"
+            if processed_binned[k] > 0 else f"{bin_labels[k]}: n/a"
+            for k in range(5)
+        ]
+        print(f"Binned accuracy    | {' | '.join(bin_accs)}", flush=True)
+
+        if best_tail_metric is None or tail_metric > best_tail_metric:
+            best_epoch = epoch
+            best_tail_metric = tail_metric
+            best_top1 = top_k_accs[0]
+            best_top5 = top_k_accs[4]
+            best_bin_accs = bin_accs
+
+        writer_summary.add_scalar("summary/loss", avg_loss, epoch)
+        writer_summary.add_scalar("summary/tail_metric", tail_metric, epoch)
+        for k, bin_range in enumerate(["1_4", "5_9", "10_19", "20_49", "50_"]):
+            if processed_binned[k] > 0:
+                writer_summary.add_scalar(
+                    f"summary/{bin_range}",
+                    100.0 * correct_binned[k] / processed_binned[k],
+                    epoch,
+                )
+        for k in range(5):
+            writer_summary.add_scalar(f"summary/top{k + 1:d}", top_k_accs[k], epoch)
+        for a in abstentions:
+            for i, threshold in enumerate(thresholds):
+                denom = abstention_processed[a][i]
+                writers_abstention[a].add_scalar(
+                    f"abstention/acc_wrt_predicted_epoch_{epoch:d}",
+                    0.0 if denom == 0 else 100.0 * abstention_correct[a][i] / denom,
+                    round(100 * denom / processed),
                 )
 
-    top_k_accs = [float(f"{100.0 * tc / processed:3.3f}") for tc in top_correct]
-    avg_loss = running_loss / (step + 1)
-    # Tail-aware metric: mean accuracy for bins 0,1,2 (1-4, 5-9, 10-19)
-    tail_accs = []
-    for k in range(3):
-        if processed_binned[k] > 0:
-            tail_accs.append(100.0 * correct_binned[k] / processed_binned[k])
-    tail_metric = float(sum(tail_accs)) / max(len(tail_accs), 1)
+    if best_epoch is None:
+        raise RuntimeError("No checkpoints were evaluated; cannot report a best epoch")
+
+    print("=" * 80, flush=True)
     print(
-        f"Epoch {epoch} complete | loss={avg_loss:.4f} | "
-        f"top1={top_k_accs[0]:.2f}% | top5={top_k_accs[4]:.2f}% | tail_metric={tail_metric:.3f}",
+        f"Best epoch: {best_epoch} | tail={best_tail_metric:.3f}% | "
+        f"top1={best_top1:.2f}% | top5={best_top5:.2f}%",
         flush=True,
     )
-    bin_labels = ["1-4", "5-9", "10-19", "20-49", "50+"]
-    bin_accs = [
-        f"{bin_labels[k]}: {100.0 * correct_binned[k] / processed_binned[k]:.1f}%"
-        if processed_binned[k] > 0 else f"{bin_labels[k]}: n/a"
-        for k in range(5)
-    ]
-    print(f"Binned accuracy    | {' | '.join(bin_accs)}", flush=True)
+    print(f"Best binned accuracy | {' | '.join(best_bin_accs)}", flush=True)
+    print("=" * 80, flush=True)
 
-    # TensorBoard logging
-    writer_summary.add_scalar("summary/loss", avg_loss, epoch)
-    writer_summary.add_scalar("summary/tail_metric", tail_metric, epoch)
-    for k, bin_range in enumerate(["1_4", "5_9", "10_19", "20_49", "50_"]):
-        if processed_binned[k] > 0:
-            writer_summary.add_scalar(
-                f"summary/{bin_range}",
-                100.0 * correct_binned[k] / processed_binned[k],
-                epoch,
-            )
-    for k in range(5):
-        writer_summary.add_scalar(f"summary/top{k + 1:d}", top_k_accs[k], epoch)
-    for a in abstentions:
-        for i, threshold in enumerate(thresholds):
-            denom = abstention_processed[a][i]
-            writers_abstention[a].add_scalar(
-                f"abstention/acc_wrt_predicted_epoch_{epoch:d}",
-                0.0 if denom == 0 else 100.0 * abstention_correct[a][i] / denom,
-                round(100 * denom / processed),
-            )
+if __name__ == "__main__":
+    main()

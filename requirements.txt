@@ -1,0 +1,20 @@
+# Core ML/DL packages (versions pinned to match environment.yml)
+timm==1.0.26
+transformers==4.49.0
+
+# Utils
+tqdm==4.65.0
+pillow==9.4.0
+pandas==1.5.2
+pyyaml==6.0
+requests==2.29.0
+gdown==5.2.1
+
+# HuggingFace ecosystem
+huggingface_hub==0.14.1
+
+# Tensorboard visualization
+tensorboard==2.13.0
+
+# Note: torch, torchaudio, torchvision, and numpy are platform-specific
+# Install PyTorch first for your platform: https://pytorch.org/get-started

@@ -42,33 +42,3 @@ for class_i in tqdm(classes):
   instance_count[class_i] = instance_count_i
 # save training observation count for validation later on
 pickle.dump(instance_count, open('instance_count.pkl', 'wb'))
-
-# # Print summary statistics for classes and split sizes
-# train_dir = 'dataset/train'
-# test_dir = 'dataset/test'
-
-# train_classes = []
-# test_classes = []
-# train_files = 0
-# test_files = 0
-
-# if os.path.isdir(train_dir):
-#   for c in os.listdir(train_dir):
-#     p = os.path.join(train_dir, c)
-#     if os.path.isdir(p):
-#       train_classes.append(c)
-#       train_files += len([f for f in os.listdir(p) if os.path.isfile(os.path.join(p, f))])
-
-# if os.path.isdir(test_dir):
-#   for c in os.listdir(test_dir):
-#     p = os.path.join(test_dir, c)
-#     if os.path.isdir(p):
-#       test_classes.append(c)
-#       test_files += len([f for f in os.listdir(p) if os.path.isfile(os.path.join(p, f))])
-
-# total_classes = len(set(train_classes) | set(test_classes))
-
-# print('\nSplit summary:')
-# print(f'  Total classes (train+test unique): {total_classes}')
-# print(f'  Train classes: {len(train_classes)}, Train images: {train_files}')
-# print(f'  Test classes:  {len(test_classes)}, Test images:  {test_files}\n')
