@@ -1,6 +1,6 @@
 # Aotearoa Bird Classifier
 
-Deep learning project based on [Aotearoa Species Classifier](https://github.com/Waikato/aotearoa-species-classifier). Reproduced model on birds subset of original dataset and investigated backbones, losses, and augmentations.
+Deep learning project based on original [Aotearoa Species Classifier](https://github.com/Waikato/aotearoa-species-classifier). Reproduced model on bird subset of original dataset and investigated loss functions, backbone architectures, pretraining, and data augmentation strategies.
 
 ## Installation
 
@@ -32,34 +32,37 @@ conda activate species
 
 ### Download Data Files
 ```bash
-gdown 1L74V_Fqsvj1ku7drcHpBkS2imYLytsZD
-gdown 1TXnETXa2do8jMDITqOf4FIBGZME0p1xc
-gdown 1eSdpfSNjnh42FFLo3Y4cxZ3025N-YK7a
+gdown "https://drive.google.com/file/d/1L74V_Fqsvj1ku7drcHpBkS2imYLytsZD/view" -O multimedia.txt
+gdown "https://drive.google.com/file/d/1TXnETXa2do8jMDITqOf4FIBGZME0p1xc/view" -O NZ-Species.csv
+gdown "https://drive.google.com/file/d/1eSdpfSNjnh42FFLo3Y4cxZ3025N-YK7a/view" -O captive_cultivated.csv
 ```
 
-### Prepare Data
+### Prepare Bird Subset
 ```bash
 python download_res_grade.py                # Download bird subset (1/2)
 python download_cap_cul.py                  # Download bird subset (2/2)
 python perform_sanitise_instructions.py     # Clean data
-python split.py                             # Split into train/test
+python split.py                             # Split into train/val
+```
+
+## Trained Models
+`models.zip` contains the best checkpoint for each combination investigated, preserving the `models/{backbone}_{loss}_{augment}` directory structure.
+```bash
+gdown "https://drive.google.com/file/d/1K7ejJeEZvT1N1dtI37Xlg_WHZ_D_e4oO/view" -0 models.zip
+unzip -qq models.zip
 ```
 
 ## Training
-
 ```bash
-python fine_tune.py \
-  --backbone <backbone> \
-  --loss <loss> \
-  --augment <augment>
+python fine_tune.py --backbone <backbone> --loss <loss> --augment <augment>
 ```
 
 **Backbone options:**
-- `env2` - EfficientNetV2-S (ImageNet21k, default)
-- `cnx_i` - ConvNeXt-S (ImageNet22k)
+- `env2` - EfficientNetV2-S (ImageNet-21k, default)
+- `cnx_i` - ConvNeXt-S (ImageNet-22k)
 - `cnx_d` - ConvNeXt-S (DINOv3)
-- `vit_i` - ViT-B (ImageNet21k)
-- `vit_inat` - ViT-B (iNaturalist finetuned)
+- `vit_i` - ViT-B (ImageNet-21k)
+- `vit_inat` - ViT-B (ImageNet-21k + iNaturalist)
 - `vit_d` - ViT-B (DINOv3)
 
 **Loss options:**
@@ -75,7 +78,7 @@ python fine_tune.py \
 
 **Example:**
 ```bash
-python fine_tune.py --backbone cnx_i --loss ldam --augment mixup
+python fine_tune.py --backbone vit_d --loss ldam --augment mixup
 ```
 
 Models are saved to `models/{backbone}_{loss}_{augment}/` with TensorBoard logs in `tb/`.
@@ -83,9 +86,7 @@ Models are saved to `models/{backbone}_{loss}_{augment}/` with TensorBoard logs 
 ## Evaluation
 
 ```bash
-python validate.py \
-  --backbone <backbone> \
-  --name <model dir>
+python validate.py --model <model dir>
 ```
 
 ## Monitoring

@@ -96,6 +96,14 @@ def get_num_classes_from_checkpoint(checkpoint):
                 return state[key].shape[0]
     raise KeyError("Cannot determine num_classes from checkpoint.")
 
+def infer_backbone_from_model_dir(model_dir: Path):
+    parts = model_dir.name.split("_")
+    for i in range(1, len(parts) + 1):
+        candidate = "_".join(parts[:i])
+        if candidate in BACKBONES:
+            return candidate
+    raise ValueError(f"Could not infer backbone from model directory name: {model_dir.name}")
+
 def instance_bin(n):
     if n < 5:  return 0
     if n < 10: return 1
@@ -125,10 +133,8 @@ def seed_everything(seed):
 # args
 def parse_args():
     parser = argparse.ArgumentParser(description="Validate bird species classifier checkpoints")
-    parser.add_argument("--backbone", choices=list(BACKBONES.keys()), default="env2",
-                        help="Backbone (must match the training run)")
-    parser.add_argument("--name", required=True,
-                        help="Experiment name — looks for models/<name>/ and writes to tb/<name>/")
+    parser.add_argument("--model", required=True,
+                        help="Model directory name — looks for models/<model>/ and writes to tb/<model>/")
     parser.add_argument("--start", type=int, default=None,
                         help="First epoch to evaluate; defaults to the smallest checkpoint found")
     parser.add_argument("--end", type=int, default=None,
@@ -145,9 +151,6 @@ def parse_args():
 def main():
     args = parse_args()
 
-    _, val_resize, val_crop = BACKBONES[args.backbone]
-    is_hf_backbone = args.backbone in {"vit_i", "vit_inat"}
-
     seed_everything(args.seed)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -158,7 +161,7 @@ def main():
         0.8, 0.85, 0.9, 0.95, 0.96, 0.97, 0.98, 0.99, 0.995, 0.998, 0.999,
     ]
 
-    checkpoints_dir = Path(f"models/{args.name}")
+    checkpoints_dir = Path(f"models/{args.model}")
     discovered_epochs = discover_checkpoint_epochs(checkpoints_dir)
 
     if args.start is None:
@@ -175,7 +178,10 @@ def main():
         visible_gpu_count = torch.cuda.device_count()
         print(f"Visible CUDA devices: {visible_gpu_count}", flush=True)
         print(f"GPU names: {[torch.cuda.get_device_name(g) for g in range(visible_gpu_count)]}", flush=True)
-    print(f"Backbone: {args.backbone}", flush=True)
+    backbone = infer_backbone_from_model_dir(checkpoints_dir)
+    _, val_resize, val_crop = BACKBONES[backbone]
+    is_hf_backbone = backbone in {"vit_i", "vit_inat"}
+    print(f"Backbone: {backbone}", flush=True)
     print(f"Checkpoints dir: {checkpoints_dir}", flush=True)
     print(f"Epoch range: {args.start} -> {args.end} (step {args.step})", flush=True)
     print("=" * 80, flush=True)
@@ -185,7 +191,7 @@ def main():
     num_classes = get_num_classes_from_checkpoint(first_ckpt)
     del first_ckpt
 
-    model_name, _, _ = BACKBONES[args.backbone]
+    model_name, _, _ = BACKBONES[backbone]
     if is_hf_backbone:
         try:
             from transformers import AutoImageProcessor, AutoModelForImageClassification
@@ -239,9 +245,9 @@ def main():
         for k, v in val_dataset.class_to_idx.items()
     } if instance_count is not None else {}
 
-    writer_summary = SummaryWriter(f"tb/{args.name}/test_summary")
+    writer_summary = SummaryWriter(f"tb/{args.model}/test_summary")
     writers_abstention = {
-        a: SummaryWriter(f"tb/{args.name}/test_{a}") for a in abstentions
+        a: SummaryWriter(f"tb/{args.model}/test_{a}") for a in abstentions
     }
 
     best_epoch = None

@@ -409,7 +409,7 @@ def main():
     elif args.loss == "wce":
         criterion = nn.CrossEntropyLoss(weight=weights)
     elif args.loss == "focal":
-        criterion = FocalLoss(gamma=2.0, weight=weights)
+        criterion = FocalLoss(gamma=2.0)
     elif args.loss == "ldam":
         criterion = LDAMLoss(class_counts=class_counts.to(device))
     criterion = criterion.to(device)
