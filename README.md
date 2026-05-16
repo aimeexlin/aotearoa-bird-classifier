@@ -48,7 +48,7 @@ python split.py                             # Split into train/val
 ## Trained Models
 `models.zip` contains the best checkpoint for each combination investigated, preserving the `models/{backbone}_{loss}_{augment}` directory structure.
 ```bash
-gdown "https://drive.google.com/file/d/1K7ejJeEZvT1N1dtI37Xlg_WHZ_D_e4oO/view" -0 models.zip
+gdown "https://drive.google.com/file/d/1g_2RfuGjdUJ-aaJ-hzWD39PxOttSVPcY/view" -0 models.zip
 unzip -qq models.zip
 ```
 
@@ -59,11 +59,10 @@ python fine_tune.py --backbone <backbone> --loss <loss> --augment <augment>
 
 **Backbone options:**
 - `env2` - EfficientNetV2-S (ImageNet-21k, default)
-- `cnx_i` - ConvNeXt-S (ImageNet-22k)
-- `cnx_d` - ConvNeXt-S (DINOv3)
-- `vit_i` - ViT-B (ImageNet-21k)
-- `vit_inat` - ViT-B (ImageNet-21k + iNaturalist)
-- `vit_d` - ViT-B (DINOv3)
+- `cnx_i` - ConvNeXt-T (ImageNet-22k)
+- `cnx_d` - ConvNeXt-T (DINOv3)
+- `vit_i` - ViT-S (ImageNet-21k)
+- `vit_d` - ViT-S (DINOv3)
 
 **Loss options:**
 - `ce` - Cross-Entropy (default)
@@ -73,8 +72,8 @@ python fine_tune.py --backbone <backbone> --loss <loss> --augment <augment>
 
 **Augment options:**
 - `auto` - AutoAugment (default)
-- `mixup` - Mixup augmentation
-- `cutmix` - CutMix augmentation
+- `mixup` - MixUp
+- `cutmix` - CutMix
 
 **Example:**
 ```bash
