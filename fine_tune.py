@@ -29,13 +29,13 @@ def get_logits(output):
 
 # backbones configs
 BACKBONES = {
-    #            timm name                                                        batch  train  val_resize  val_crop
-    "env2":     ("tf_efficientnetv2_s.in21k",                                       256,   300,    416,        384),
-    "cnx_i":    ("convnext_small.fb_in22k",                                         256,   224,    256,        224),
-    "cnx_d":    ("convnext_small.dinov3_lvd1689m",                                  256,   224,    256,        224),
-    "vit_d":    ("vit_base_patch16_dinov3.lvd1689m",                                 64,   224,    256,        224),
-    "vit_i":    ("google/vit-base-patch16-224-in21k",                                64,   224,    256,        224), 
-    "vit_inat": ("bryanzhou008/vit-base-patch16-224-in21k-finetuned-inaturalist",    64,   224,    256,        224),
+    #            timm name                                                          batch  train  val_resize  val_crop
+    "env2":     ("tf_efficientnetv2_s.in21k",                                       256,  300,    416,        384),
+    "cnx_i":    ("convnext_tiny.fb_in22k",                                          256,  224,    256,        224),
+    "cnx_d":    ("convnext_tiny.dinov3_lvd1689m",                                   256,  224,    256,        224),
+    "vit_d":    ("vit_small_patch16_dinov3.lvd1689m",                               256,  224,    256,        224),
+    "vit_i":    ("vit_small_patch16_224.augreg_in21k",                              256,  224,    256,        224), 
+    "vit_inat": ("bryanzhou008/vit-base-patch16-224-in21k-finetuned-inaturalist",   256,  224,    256,        224)
 }
 
 # training stages
@@ -335,12 +335,12 @@ def main():
     print(f"Early stopping: patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta}", flush=True)
     print("=" * 80, flush=True)
 
-    if args.backbone in {"vit_i", "vit_inat"}:
+    if args.backbone == "vit_inat":
         try:
             from transformers import AutoImageProcessor, AutoModelForImageClassification
         except ImportError as exc:
             raise ImportError(
-                "Backbones vit_i/vit_inat require transformers. Install with: pip install transformers"
+                "Backbone vit_inat requires transformers. Install with: pip install transformers"
             ) from exc
 
         model = AutoModelForImageClassification.from_pretrained(

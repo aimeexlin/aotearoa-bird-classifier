@@ -8,6 +8,7 @@ pillow==9.4.0
 pandas==1.5.2
 pyyaml==6.0
 requests==2.29.0
+scikit-learn==1.7.2
 gdown==5.2.1
 
 # HuggingFace ecosystem
